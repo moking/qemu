@@ -310,4 +310,43 @@ uint64_t cxl_device_get_timestamp(CXLDeviceState *cxlds);
 
 void cxl_set_poison_list_overflowed(CXLType3Dev *ct3d);
 
+typedef struct CXLDCD_Extent {
+	uint64_t start_dpa;
+	uint64_t len;
+	uint8_t tag[0x10];
+	uint16_t shared_seq;
+	uint8_t region_id;
+    QTAILQ_ENTRY(CXLDCD_Extent) node;
+}CXLDCD_Extent;
+typedef QTAILQ_HEAD(, CXLDCD_Extent) CXLDCDExtentList;
+
+struct CXLDCD_Region {
+	uint64_t base;
+	uint64_t decode_len; /*256MB aligned*/
+	uint64_t len;
+	uint64_t block_size;
+	uint32_t dsmadhandle;
+	uint8_t flags;
+};
+
+#define DCD_MAX_REGION_NUM 8
+
+struct CXLDynCapDev {
+	uint8_t num_hosts; //Table 7-55
+	uint8_t num_regions; // 1-8
+	uint8_t sanitize_mask; // sanitize on release configuration support mask
+	uint16_t cap_add_policy; // only bits 0-2 used, bit 3 should be 0
+	uint16_t cap_removal_policy; // only bits 0-1 used, bit 3 should be 0
+	struct CXLDCD_Region regions[DCD_MAX_REGION_NUM];
+	uint64_t block_size_marks[DCD_MAX_REGION_NUM];
+	uint32_t total_extent_count;
+	uint32_t ext_list_gen_seq;
+	uint64_t total_dynamic_capicity; // 256M aligned
+	CXLDCDExtentList extents;
+    CXLDeviceState cxl_dstate;
+};
+
+/* FIXME: Fan */
+#define TYPE_CXL_DCD "cxl-dcd"
+OBJECT_DECLARE_TYPE(CXLDynCapDev, CXLType3Class, CXL_DCD)
 #endif

@@ -66,6 +66,18 @@ enum {
         #define GET_POISON_LIST        0x0
         #define INJECT_POISON          0x1
         #define CLEAR_POISON           0x2
+	DCD_CONFIG = 0x48, /*8.2.9.8.9*/
+		#define GET_DC_REGION_CONFIG     0x0
+		#define GET_DYN_CAP_EXT_LIST   0x1
+		#define ADD_DYN_CAP_RSP 	   0x2
+		#define RELEASE_DYN_CAP        0x3
+	DCD_MANAGEMENT = 0x56, /* 7.6.7.6 */
+		#define GET_DCD_INFO 	0x0
+		#define GET_HOST_DC_CONFIG 0x1
+		#define SET_DC_REGION_CONFIG 0x2
+		#define GET_DC_REGION_EXT_LIST 0x3
+		#define INIT_DYNAMIC_CAP_ADD 0x4
+		#define INIT_DYNAMIC_CAP_RELEASE 0x5
 };
 
 /* 8.2.8.4.5.1 Command Return Codes */
@@ -93,7 +105,8 @@ typedef enum {
     CXL_MBOX_INCORRECT_PASSPHRASE = 0x14,
     CXL_MBOX_UNSUPPORTED_MAILBOX = 0x15,
     CXL_MBOX_INVALID_PAYLOAD_LENGTH = 0x16,
-    CXL_MBOX_MAX = 0x17
+	CXL_MBOX_INVALID_EXTENT_LIST = 0x17,
+    CXL_MBOX_MAX = 0x18
 } CXLRetCode;
 
 struct cxl_cmd;
@@ -586,6 +599,292 @@ static CXLRetCode cmd_media_clear_poison(struct cxl_cmd *cmd,
     return CXL_MBOX_SUCCESS;
 }
 
+/*8.2.9.8.9.2
+ *FIXME: Fan
+ * check the return value for unsupport or invalid input
+ */
+static CXLRetCode cmd_dcd_get_dyn_cap_config(struct cxl_cmd *cmd,
+                                            CXLDeviceState *cxl_dstate,
+                                            uint16_t *len)
+{
+    struct get_dyn_cap_config_in_pl {
+        uint8_t region_cnt;
+		uint8_t start_region_id;
+    } QEMU_PACKED;
+
+    struct get_dyn_cap_config_out_pl {
+        uint8_t num_regions;
+        uint8_t rsvd1[7];
+        struct {
+            uint64_t base;
+            uint64_t decode_len;
+            uint64_t region_len;
+			uint64_t block_size;
+			uint32_t dsmadhandle;
+			uint8_t flags;
+			uint8_t rsvd2[3];
+        } QEMU_PACKED records[];
+    } QEMU_PACKED;
+
+    struct get_dyn_cap_config_in_pl *in = (void *)cmd->payload;
+    struct get_dyn_cap_config_out_pl *out = (void *)cmd->payload;
+    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    uint16_t record_count = 0, i = 0;
+    uint16_t out_pl_len;
+
+	if (in->start_region_id >= dcd->num_regions)
+		record_count = 0;
+	else if (dcd->num_regions - in->start_region_id < in->region_cnt)
+		record_count = dcd->num_regions - in->start_region_id;
+	else
+		record_count = in->region_cnt;
+
+	out_pl_len = sizeof(*out) + record_count * sizeof(out->records[0]);
+    assert(out_pl_len <= CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+
+    memset(out, 0, out_pl_len);
+    out->num_regions = record_count;
+	for(; i<record_count; i++){
+		stq_le_p(&out->records[i].base,
+			dcd->regions[in->start_region_id+i].base);
+		stq_le_p(&out->records[i].decode_len,
+			dcd->regions[in->start_region_id+i].decode_len);
+		stq_le_p(&out->records[i].region_len,
+			dcd->regions[in->start_region_id+i].len);
+		stq_le_p(&out->records[i].block_size,
+			dcd->regions[in->start_region_id+i].block_size);
+		stl_le_p(&out->records[i].dsmadhandle,
+			dcd->regions[in->start_region_id+i].dsmadhandle);
+		out->records[i].flags
+			= dcd->regions[in->start_region_id+i].flags;
+	}
+
+	*len = out_pl_len;
+	return CXL_MBOX_SUCCESS;
+}
+
+/*8.2.9.8.9.2*/
+static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(struct cxl_cmd *cmd,
+                                            CXLDeviceState *cxl_dstate,
+                                            uint16_t *len)
+{
+    struct get_dyn_cap_ext_list_in_pl {
+        uint8_t extent_cnt;
+		uint8_t start_extent_id;
+    } QEMU_PACKED;
+
+    struct get_dyn_cap_ext_list_out_pl {
+		uint32_t count;
+		uint32_t total_extents;
+		uint32_t generation_num;
+		uint8_t rsvd[4];
+        struct {
+			uint64_t start_dpa;
+			uint64_t len;
+			uint8_t tag[0x10];
+			uint16_t shared_seq;
+			uint8_t rsvd[6];
+        } QEMU_PACKED records[];
+    } QEMU_PACKED;
+
+    struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
+    struct get_dyn_cap_ext_list_out_pl *out = (void *)cmd->payload;
+    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    uint16_t record_count = 0, i = 0, record_done=0;
+	CXLDCDExtentList *extent_list = &dcd->extents;
+	CXLDCD_Extent *ent;
+    uint16_t out_pl_len;
+
+	if(in->start_extent_id >= dcd->total_extent_count)
+		return CXL_MBOX_INVALID_INPUT;
+
+	if (dcd->total_extent_count - in->start_extent_id < in->extent_cnt)
+		record_count = dcd->total_extent_count - in->start_extent_id;
+	else
+		record_count = in->extent_cnt;
+
+	out_pl_len = sizeof(*out) + record_count * sizeof(out->records[0]);
+    assert(out_pl_len <= CXL_MAILBOX_MAX_PAYLOAD_SIZE);
+
+    memset(out, 0, out_pl_len);
+    stl_le_p(&out->count, record_count);
+	stl_le_p(&out->total_extents, dcd->total_extent_count);
+	stl_le_p(&out->generation_num, dcd->ext_list_gen_seq);
+
+    QTAILQ_FOREACH(ent, extent_list, node) {
+		if (i++ < in->start_extent_id)
+			continue;
+		stq_le_p(&out->records[i].start_dpa, ent->start_dpa);
+		stq_le_p(&out->records[i].len, ent->len);
+		memcpy(&out->records[i].tag, ent->tag, 0x10);
+		stw_le_p(&out->records[i].shared_seq, ent->shared_seq);
+		record_done ++;
+		if (record_done == record_count)
+			break;
+	}
+
+	*len = out_pl_len;
+	return CXL_MBOX_SUCCESS;
+}
+
+static CXLRetCode check_extent_range(CXLDynCapDev *dev,
+		uint64_t dpa, uint64_t len)
+{
+	uint8_t rid = 0;
+	struct CXLDCD_Region *region;
+	for (; rid < dev->num_regions; rid ++){
+		region = &dev->regions[rid];
+
+		if (dpa < region->base) {
+			return CXL_MBOX_INVALID_PA;
+		} else {
+			if (dpa + len <= region->base + region->len) {
+				if (dpa%region->block_size || len %region->block_size)
+					return CXL_MBOX_INVALID_EXTENT_LIST;
+				else
+					return CXL_MBOX_SUCCESS;
+			} else if (dpa < region->base + region->len)
+				return CXL_MBOX_INVALID_EXTENT_LIST;
+		}
+	}
+	return CXL_MBOX_INVALID_PA;
+}
+
+static uint8_t find_region_id(struct CXLDynCapDev *dev, uint64_t dpa) {
+	uint8_t i=0;
+
+	while ( i< dev->num_regions && dpa < dev->regions[i].base)
+		i ++;
+	return i;
+
+}
+
+/*8.2.9.8.9.3*/
+// FIXME: not efficient
+static CXLRetCode cmd_dcd_add_dyn_cap_rsp(struct cxl_cmd *cmd,
+                                            CXLDeviceState *cxl_dstate,
+                                            uint16_t *len_unused)
+{
+    struct get_dyn_cap_ext_list_in_pl {
+        uint32_t num_entries_updated;
+		uint8_t rsvd[4];
+        struct {
+			uint64_t start_dpa;
+			uint64_t len;
+			uint8_t rsvd[8];
+        } QEMU_PACKED updated_entries[];
+    } QEMU_PACKED;
+
+    struct get_dyn_cap_ext_list_in_pl *in = (void *)cmd->payload;
+    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    CXLDCDExtentList *extent_list = &dcd->extents;
+    CXLDCD_Extent *ent;
+	uint32_t i;
+	uint64_t dpa, len;
+	CXLRetCode rs;
+
+	if(in->num_entries_updated == 0)
+		return CXL_MBOX_SUCCESS;
+
+	for (i=0; i<in->num_entries_updated; i++) {
+		dpa = in->updated_entries[i].start_dpa;
+		len = in->updated_entries[i].len;
+
+		if (dpa & 0x3f)
+			return CXL_MBOX_INVALID_EXTENT_LIST;
+		rs = check_extent_range(dcd, dpa, len);
+		if (rs)
+			return rs;
+
+		QTAILQ_FOREACH(ent, extent_list, node) {
+			if (ent->start_dpa == dpa && ent->len == len)
+				return CXL_MBOX_INVALID_PA;
+			if (ent->start_dpa <= dpa
+				&& dpa + len <= ent->start_dpa + ent->len) {
+				ent->start_dpa = dpa;
+				ent->len = len;
+				break;
+			} else if ((dpa < ent->start_dpa + ent->len
+				&& dpa + len > ent->start_dpa + ent->len)
+				|| (dpa < ent->start_dpa && dpa + len > ent->start_dpa))
+				return CXL_MBOX_INVALID_EXTENT_LIST;
+		}
+		// a new extent added
+		if (!ent) {
+			ent = g_new0(CXLDCD_Extent, 1);
+			assert(ent);
+			ent->start_dpa = dpa;
+			ent->len = len;
+			ent->region_id = find_region_id(dcd, dpa);
+			assert(ent->region_id < dcd->num_regions);
+			/* FIXME: Fan
+			 * How to set tag and shared_seq;
+			 * */
+			QTAILQ_INSERT_TAIL(extent_list, ent, node);
+		}
+	}
+
+    return CXL_MBOX_SUCCESS;
+}
+
+/*8.2.9.8.9.4*/
+static CXLRetCode cmd_dcd_release_dcd_capacity(struct cxl_cmd *cmd,
+                                            CXLDeviceState *cxl_dstate,
+                                            uint16_t *len_unused)
+{
+    struct release_dcd_cap_in_pl {
+        uint32_t num_entries_updated;
+		uint8_t rsvd[4];
+        struct {
+			uint64_t start_dpa;
+			uint64_t len;
+			uint8_t rsvd[8];
+        } QEMU_PACKED updated_entries[];
+    } QEMU_PACKED;
+
+    struct release_dcd_cap_in_pl *in = (void *)cmd->payload;
+    struct CXLDynCapDev *dcd = container_of(cxl_dstate, CXLDynCapDev, cxl_dstate);
+    CXLDCDExtentList *extent_list = &dcd->extents;
+    CXLDCD_Extent *ent;
+	uint32_t i;
+	uint64_t dpa, len;
+	CXLRetCode rs;
+
+	if(in->num_entries_updated == 0)
+		return CXL_MBOX_INVALID_INPUT;
+
+	for (i=0; i<in->num_entries_updated; i++) {
+		dpa = in->updated_entries[i].start_dpa;
+		len = in->updated_entries[i].len;
+
+		if (dpa & 0x3f)
+			return CXL_MBOX_INVALID_EXTENT_LIST;
+		rs = check_extent_range(dcd, dpa, len);
+		if (rs)
+			return rs;
+
+		QTAILQ_FOREACH(ent, extent_list, node) {
+			if (ent->start_dpa == dpa && ent->len == len)
+				return CXL_MBOX_INVALID_PA;
+			if (ent->start_dpa <= dpa
+				&& dpa + len <= ent->start_dpa + ent->len) {
+				ent->start_dpa = dpa;
+				ent->len = len;
+				break;
+			} else if ((dpa < ent->start_dpa + ent->len
+				&& dpa + len > ent->start_dpa + ent->len)
+				|| (dpa < ent->start_dpa && dpa + len > ent->start_dpa))
+				return CXL_MBOX_INVALID_EXTENT_LIST;
+		}
+		// found the entry, release it
+		if (ent) {
+			QTAILQ_REMOVE(extent_list, ent, node);
+		}
+	}
+
+	return CXL_MBOX_SUCCESS;
+}
+
 #define IMMEDIATE_CONFIG_CHANGE (1 << 1)
 #define IMMEDIATE_DATA_CHANGE (1 << 2)
 #define IMMEDIATE_POLICY_CHANGE (1 << 3)
@@ -619,6 +918,17 @@ static struct cxl_cmd cxl_cmd_set[256][256] = {
         cmd_media_inject_poison, 8, 0 },
     [MEDIA_AND_POISON][CLEAR_POISON] = { "MEDIA_AND_POISON_CLEAR_POISON",
         cmd_media_clear_poison, 72, 0 },
+	[DCD_CONFIG][GET_DC_REGION_CONFIG] = { "DCD_GET_DC_REGION_CONFIG",
+		cmd_dcd_get_dyn_cap_config, 2, 0 },
+	[DCD_CONFIG][GET_DYN_CAP_EXT_LIST] = {
+		"DCD_GET_DYNAMIC_CAPACITY_EXTENT_LIST", cmd_dcd_get_dyn_cap_ext_list,
+		8, 0 },
+	[DCD_CONFIG][ADD_DYN_CAP_RSP] = {
+		"ADD_DCD_DYNAMIC_CAPACITY_RESPONSE", cmd_dcd_add_dyn_cap_rsp,
+		~0, IMMEDIATE_DATA_CHANGE },
+	[DCD_CONFIG][RELEASE_DYN_CAP] = {
+		"RELEASE_DCD_DYNAMIC_CAPACITY", cmd_dcd_release_dcd_capacity,
+		~0, IMMEDIATE_DATA_CHANGE },
 };
 
 void cxl_process_mailbox(CXLDeviceState *cxl_dstate)
