@@ -1407,7 +1407,7 @@ static CXLRetCode cmd_dcd_get_dyn_cap_ext_list(const struct cxl_cmd *cmd,
  * Check whether any bit between addr[nr, nr+size) is set,
  * return true if any bit is set, otherwise return false
  */
-static bool test_any_bits_set(const unsigned long *addr, unsigned long nr,
+bool test_any_bits_set(const unsigned long *addr, unsigned long nr,
                               unsigned long size)
 {
     unsigned long res = find_next_bit(addr, size + nr, nr);
@@ -1446,7 +1446,7 @@ CXLDCRegion *cxl_find_dc_region(CXLType3Dev *ct3d, uint64_t dpa, uint64_t len)
     return NULL;
 }
 
-static void cxl_insert_extent_to_extent_list(CXLDCExtentList *list,
+void cxl_insert_extent_to_extent_list(CXLDCExtentList *list,
                                              uint64_t dpa,
                                              uint64_t len,
                                              uint8_t *tag,
@@ -1592,15 +1592,32 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
         }
 
         /*
-         * TODO: we will add a pending extent list based on event log record
-         * and verify the input response; also, the "More" flag is not
-         * considered at the moment.
+         * TODO: we assume that one extent in the pending
+         * list will at most lead to one accepted extent in the response.
+         * For the case where multiple portions of the original extent
+         * get accepted as separate extents, we need extra processing here.
          */
+        QTAILQ_FOREACH(ent, &ct3d->dc.extents_pending, node) {
+            if (ent->start_dpa <= dpa &&
+                dpa + len <= ent->start_dpa + ent->len) {
+                break;
+            }
+        }
+        if (!ent) {
+            return CXL_MBOX_INVALID_PA;
+        }
+
+        cxl_remove_extent_from_extent_list(&ct3d->dc.extents_pending,
+                                           ent);
 
         cxl_insert_extent_to_extent_list(extent_list, dpa, len, NULL, 0);
         ct3d->dc.total_extent_count += 1;
     }
 
+    /*
+     * TODO: extents_pending needs to be cleared so the extents not
+     * accepted can be reclaimed base on spec r3.1: 8.2.9.9.9.3
+     */
     return CXL_MBOX_SUCCESS;
 }
 

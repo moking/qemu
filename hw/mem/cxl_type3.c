@@ -661,6 +661,7 @@ static bool cxl_create_dc_regions(CXLType3Dev *ct3d, Error **errp)
         ct3d->dc.total_capacity += region->len;
     }
     QTAILQ_INIT(&ct3d->dc.extents);
+    QTAILQ_INIT(&ct3d->dc.extents_pending);
 
     return true;
 }
@@ -671,6 +672,10 @@ static void cxl_destroy_dc_regions(CXLType3Dev *ct3d)
 
     QTAILQ_FOREACH_SAFE(ent, &ct3d->dc.extents, node, ent_next) {
         cxl_remove_extent_from_extent_list(&ct3d->dc.extents, ent);
+    }
+    QTAILQ_FOREACH_SAFE(ent, &ct3d->dc.extents_pending, node, ent_next) {
+        cxl_remove_extent_from_extent_list(&ct3d->dc.extents_pending,
+                                           ent);
     }
 }
 
@@ -1436,7 +1441,8 @@ static int ct3d_qmp_cxl_event_log_enc(CxlEventLog log)
         return CXL_EVENT_TYPE_FAIL;
     case CXL_EVENT_LOG_FATAL:
         return CXL_EVENT_TYPE_FATAL;
-/* DCD not yet supported */
+    case CXL_EVENT_LOG_DYNCAP:
+        return CXL_EVENT_TYPE_DYNAMIC_CAP;
     default:
         return -EINVAL;
     }
@@ -1685,6 +1691,266 @@ void qmp_cxl_inject_memory_module_event(const char *path, CxlEventLog log,
     if (cxl_event_insert(cxlds, enc_log, (CXLEventRecordRaw *)&module)) {
         cxl_event_irq_assert(ct3d);
     }
+}
+
+/* CXL r3.1 Table 8-50: Dynamic Capacity Event Record */
+static const QemuUUID dynamic_capacity_uuid = {
+    .data = UUID(0xca95afa7, 0xf183, 0x4018, 0x8c, 0x2f,
+                 0x95, 0x26, 0x8e, 0x10, 0x1a, 0x2a),
+};
+
+typedef enum CXLDCEventType {
+    DC_EVENT_ADD_CAPACITY = 0x0,
+    DC_EVENT_RELEASE_CAPACITY = 0x1,
+    DC_EVENT_FORCED_RELEASE_CAPACITY = 0x2,
+    DC_EVENT_REGION_CONFIG_UPDATED = 0x3,
+    DC_EVENT_ADD_CAPACITY_RSP = 0x4,
+    DC_EVENT_CAPACITY_RELEASED = 0x5,
+} CXLDCEventType;
+
+/*
+ * Check whether the exact extent exists in the list
+ * Return value: the extent pointer in the list; else null
+ */
+static CXLDCExtent *cxl_dc_extent_exists(CXLDCExtentList *list,
+                                         uint64_t dpa, uint64_t len)
+{
+    CXLDCExtent *ent;
+
+    if (!list) {
+        return NULL;
+    }
+
+    QTAILQ_FOREACH(ent, list, node) {
+        if (ent->start_dpa == dpa && ent->len == len) {
+            return ent;
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * The main function to process dynamic capacity event. Currently DC extents
+ * add/release requests are processed.
+ */
+static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
+                                             CXLDCEventType type, uint16_t hid,
+                                             uint8_t rid,
+                                             CXLDCExtentRecordList *records,
+                                             Error **errp)
+{
+    Object *obj;
+    CXLEventDynamicCapacity dCap = {};
+    CXLEventRecordHdr *hdr = &dCap.hdr;
+    CXLType3Dev *dcd;
+    uint8_t flags = 1 << CXL_EVENT_TYPE_INFO;
+    uint32_t num_extents = 0;
+    CXLDCExtentRecordList *list;
+    g_autofree CXLDCExtentRaw *extents = NULL;
+    uint8_t enc_log;
+    uint64_t offset, len, block_size;
+    int i, rc;
+    g_autofree unsigned long *blk_bitmap = NULL;
+
+    obj = object_resolve_path_type(path, TYPE_CXL_TYPE3, NULL);
+    if (!obj) {
+        error_setg(errp, "Unable to resolve CXL type 3 device");
+        return;
+    }
+
+    dcd = CXL_TYPE3(obj);
+    if (!dcd->dc.num_regions) {
+        error_setg(errp, "No dynamic capacity support from the device");
+        return;
+    }
+
+    rc = ct3d_qmp_cxl_event_log_enc(log);
+    if (rc < 0) {
+        error_setg(errp, "Unhandled error log type");
+        return;
+    }
+    enc_log = rc;
+
+    if (rid >= dcd->dc.num_regions) {
+        error_setg(errp, "region id is too large");
+        return;
+    }
+    block_size = dcd->dc.regions[rid].block_size;
+    blk_bitmap = bitmap_new(dcd->dc.regions[rid].len / block_size);
+
+    /* Sanity check and count the extents */
+    list = records;
+    while (list) {
+        uint64_t start_dpa;
+
+        offset = list->value->offset;
+        len = list->value->len;
+        start_dpa = offset + dcd->dc.regions[rid].base;
+        if (len == 0) {
+            error_setg(errp, "extent with 0 length is not allowed");
+            return;
+        }
+
+        if (offset % block_size || len % block_size) {
+            error_setg(errp, "dpa or len is not aligned to region block size");
+            return;
+        }
+
+        if (offset + len > dcd->dc.regions[rid].len) {
+            error_setg(errp, "extent range is beyond the region end");
+            return;
+        }
+
+        /* No duplicate or overlapped extents are allowed */
+        if (test_any_bits_set(blk_bitmap, offset / block_size,
+                              len / block_size)) {
+            error_setg(errp, "duplicate or overlapped extents are detected");
+            return;
+        }
+        bitmap_set(blk_bitmap, offset / block_size, len / block_size);
+
+        num_extents++;
+        switch (type) {
+        case DC_EVENT_RELEASE_CAPACITY:
+        case DC_EVENT_FORCED_RELEASE_CAPACITY:
+            if (!cxl_dc_extent_exists(&dcd->dc.extents_pending,
+                                      start_dpa, len)) {
+                if (!cxl_dc_extent_exists(&dcd->dc.extents, start_dpa, len)) {
+                    error_setg(errp, "cannot release non-existing extent");
+                    return;
+                }
+            } else {
+                /*
+                 * If the extent to release is still in the pending list,
+                 * skip it
+                 */
+                num_extents--;
+            }
+            break;
+        case DC_EVENT_ADD_CAPACITY:
+            if (cxl_dc_extent_exists(&dcd->dc.extents, start_dpa, len)) {
+                num_extents--;
+            }
+            break;
+        default:
+            break;
+        }
+        list = list->next;
+    }
+    if (num_extents == 0) {
+        error_setg(errp, "no valid extents to send to event log");
+        return;
+    }
+
+    /* Create extent list for event being passed to host */
+    i = 0;
+    list = records;
+    extents = g_new0(CXLDCExtentRaw, num_extents);
+    while (list) {
+        CXLDCExtent *ent;
+        uint64_t region_base;
+
+        offset = list->value->offset;
+        len = list->value->len;
+        region_base = dcd->dc.regions[rid].base;
+
+        switch (type) {
+        case DC_EVENT_RELEASE_CAPACITY:
+        case DC_EVENT_FORCED_RELEASE_CAPACITY:
+            ent = cxl_dc_extent_exists(&dcd->dc.extents_pending,
+                                       region_base + offset, len);
+            if (ent) {
+                /*
+                 * If the extent to release has not been accepted by the host,
+                 * remove it from the pending extent list, so later when
+                 * the add response for the extent arrives, the device can
+                 * reject the extent as there will not be a match in the
+                 * pending list.
+                 */
+                cxl_remove_extent_from_extent_list(&dcd->dc.extents_pending,
+                                                   ent);
+                list = list->next;
+                continue;
+            }
+            break;
+        case DC_EVENT_ADD_CAPACITY:
+            if (cxl_dc_extent_exists(&dcd->dc.extents, region_base + offset,
+                                     len)) {
+                list = list->next;
+                continue;
+            }
+            break;
+        default:
+            break;
+        }
+
+        extents[i].start_dpa = region_base + offset;
+        extents[i].len = len;
+        memset(extents[i].tag, 0, 0x10);
+        extents[i].shared_seq = 0;
+        list = list->next;
+        i++;
+    }
+
+    /*
+     * CXL r3.1 section 8.2.9.2.1.6: Dynamic Capacity Event Record
+     *
+     * All Dynamic Capacity event records shall set the Event Record Severity
+     * field in the Common Event Record Format to Informational Event. All
+     * Dynamic Capacity related events shall be logged in the Dynamic Capacity
+     * Event Log.
+     */
+    cxl_assign_event_header(hdr, &dynamic_capacity_uuid, flags, sizeof(dCap),
+                            cxl_device_get_timestamp(&dcd->cxl_dstate));
+
+    dCap.type = type;
+    /* FIXME: for now, validity flag is cleared */
+    dCap.validity_flags = 0;
+    stw_le_p(&dCap.host_id, hid);
+    /* only valid for DC_REGION_CONFIG_UPDATED event */
+    dCap.updated_region_id = 0;
+    /*
+     * FIXME: for now, the "More" flag is cleared as there is only one
+     * extent associating with each record and tag-based release is
+     * not supported.
+     */
+    dCap.flags = 0;
+    for (i = 0; i < num_extents; i++) {
+        memcpy(&dCap.dynamic_capacity_extent, &extents[i],
+               sizeof(CXLDCExtentRaw));
+
+        if (type == DC_EVENT_ADD_CAPACITY) {
+            cxl_insert_extent_to_extent_list(&dcd->dc.extents_pending,
+                                             extents[i].start_dpa,
+                                             extents[i].len,
+                                             extents[i].tag,
+                                             extents[i].shared_seq);
+        }
+
+        if (cxl_event_insert(&dcd->cxl_dstate, enc_log,
+                             (CXLEventRecordRaw *)&dCap)) {
+            cxl_event_irq_assert(dcd);
+        }
+    }
+}
+
+void qmp_cxl_add_dynamic_capacity(const char *path, uint8_t region_id,
+                                  CXLDCExtentRecordList  *records,
+                                  Error **errp)
+{
+   qmp_cxl_process_dynamic_capacity(path, CXL_EVENT_LOG_DYNCAP,
+                                    DC_EVENT_ADD_CAPACITY, 0,
+                                    region_id, records, errp);
+}
+
+void qmp_cxl_release_dynamic_capacity(const char *path, uint8_t region_id,
+                                      CXLDCExtentRecordList  *records,
+                                      Error **errp)
+{
+    qmp_cxl_process_dynamic_capacity(path, CXL_EVENT_LOG_DYNCAP,
+                                     DC_EVENT_RELEASE_CAPACITY, 0,
+                                     region_id, records, errp);
 }
 
 static void ct3_class_init(ObjectClass *oc, void *data)
