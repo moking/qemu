@@ -1622,23 +1622,57 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
     return CXL_MBOX_SUCCESS;
 }
 
+/*
+ * Copy extent list from src to dst
+ * Return value: number of extents copied
+ */
+static uint32_t copy_extent_list(CXLDCExtentList *dst,
+                                 const CXLDCExtentList *src)
+{
+    uint32_t cnt = 0;
+    CXLDCExtent *ent;
+
+    if (!dst || !src) {
+        return 0;
+    }
+
+    QTAILQ_FOREACH(ent, src, node) {
+        cxl_insert_extent_to_extent_list(dst, ent->start_dpa, ent->len,
+                                         ent->tag, ent->shared_seq);
+        cnt++;
+    }
+    return cnt;
+}
+
 static CXLRetCode cxl_dc_extent_release_dry_run(CXLType3Dev *ct3d,
                                                 CXLUpdateDCExtentListInPl *in)
 {
-    CXLDCExtent *ent;
+    CXLDCExtent *ent, *ent_next;
     uint64_t dpa, len;
     uint32_t i;
     uint32_t cnt_delta = 0;
+    CXLDCExtentList tmp_list;
+    CXLRetCode ret = CXL_MBOX_SUCCESS;
 
     if (in->num_entries_updated == 0) {
         return CXL_MBOX_INVALID_INPUT;
     }
+
+    QTAILQ_INIT(&tmp_list);
+    copy_extent_list(&tmp_list, &ct3d->dc.extents);
+
     for (i = 0; i < in->num_entries_updated; i++) {
         Range range;
 
         dpa = in->updated_entries[i].start_dpa;
         len = in->updated_entries[i].len;
 
+        /* DPA range is not fully backed with valid extents */
+        if (!ct3_test_region_block_backed(ct3d, dpa, len)) {
+            ret = CXL_MBOX_INVALID_PA;
+            goto free_and_exit;
+        }
+        /* start to detect extent overflow */
         while (len > 0) {
             QTAILQ_FOREACH(ent, &ct3d->dc.extents, node) {
                 range_init_nofail(&range, ent->start_dpa, ent->len);
@@ -1664,30 +1698,36 @@ static CXLRetCode cxl_dc_extent_release_dry_run(CXLType3Dev *ct3d,
 
                         if (cnt_delta + ct3d->dc.total_extent_count >
                             CXL_NUM_EXTENTS_SUPPORTED) {
-                            return CXL_MBOX_RESOURCES_EXHAUSTED;
+                            ret = CXL_MBOX_RESOURCES_EXHAUSTED;
+                            goto free_and_exit;
                         }
                     } else {
-                        /*
-                         * TODO: we reject the attempt to remove an extent
-                         * that overlaps with multiple extents in the device
-                         * for now, we will allow it once superset release
-                         * support is added.
-                         */
-                        return CXL_MBOX_INVALID_PA;
+                        len1 = dpa - ent->start_dpa;
+                        len2 = 0;
+                        len_done = ent->len - len1 - len2;
+
+                        if (len1) {
+                            cnt_delta++;
+                        }
+                        cnt_delta--;
                     }
 
                     len -= len_done;
                     if (!len) {
                         break;
+                    } else {
+                        dpa = ent->start_dpa + ent->len;
                     }
                 }
             }
-            if (len) {
-                return CXL_MBOX_INVALID_PA;
-            }
         }
     }
-    return CXL_MBOX_SUCCESS;
+free_and_exit:
+    QTAILQ_FOREACH_SAFE(ent, &tmp_list, node, ent_next) {
+        cxl_remove_extent_from_extent_list(&tmp_list, ent);
+    }
+
+    return ret;
 }
 
 /*
@@ -1767,10 +1807,9 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
                     }
 
                     len -= len_done;
-                    /*
-                     * len will always be 0 until superset release is add.
-                     * TODO: superset release will be added.
-                     */
+                    if (len > 0) {
+                        dpa = ent_start_dpa + ent_len;
+                    }
                     break;
                 }
             }
