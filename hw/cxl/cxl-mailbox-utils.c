@@ -1618,6 +1618,155 @@ static CXLRetCode cmd_dcd_add_dyn_cap_rsp(const struct cxl_cmd *cmd,
 }
 
 /*
+ * Return value: the id of the DC region that covers the DPA range
+ * [dpa, dpa+len) The assumption is that the range is valid and within
+ * a DC region.
+ */
+static uint8_t cxl_find_dc_region_id(const CXLType3Dev *ct3d, uint64_t dpa,
+                                     uint64_t len)
+{
+    int i;
+    const CXLDCRegion *region;
+
+    for (i = ct3d->dc.num_regions - 1; i >= 0; i--) {
+        region = &ct3d->dc.regions[i];
+        if (dpa >= region->base) {
+            break;
+        }
+    }
+    return i;
+}
+
+/*
+ * Copy extent list from src to dst
+ * Return value: number of extents copied
+ */
+static uint32_t copy_extent_list(CXLDCExtentList *dst,
+                                 const CXLDCExtentList *src)
+{
+    uint32_t cnt = 0;
+    CXLDCExtent *ent;
+
+    if (!dst || !src) {
+        return 0;
+    }
+
+    QTAILQ_FOREACH(ent, src, node) {
+        cxl_insert_extent_to_extent_list(dst, ent->start_dpa, ent->len,
+                                         ent->tag, ent->shared_seq);
+        cnt++;
+    }
+    return cnt;
+}
+
+/*
+ * Detect potential extent overflow caused by extent split during processing
+ * extent release requests, also allow releasing superset of extents where the
+ * extent to release covers the range of multiple extents in the device.
+ * Note:
+ * 1.we will reject releasing an extent if some portion of its rang is
+ * not covered by valid extents.
+ * 2.This function is called after cxl_detect_malformed_extent_list so checks
+ * already performed there will be skipped.
+ */
+static CXLRetCode cxl_detect_extent_overflow(const CXLType3Dev *ct3d,
+        const CXLUpdateDCExtentListInPl *in)
+{
+    uint64_t nbits, offset;
+    const CXLDCRegion *region;
+    unsigned long **bitmaps_copied;
+    uint64_t dpa, len;
+    int i, rid;
+    CXLRetCode ret = CXL_MBOX_SUCCESS;
+    long extent_cnt_delta = 0;
+    CXLDCExtentList tmp_list;
+    CXLDCExtent *ent;
+
+    QTAILQ_INIT(&tmp_list);
+    copy_extent_list(&tmp_list, &ct3d->dc.extents);
+
+    bitmaps_copied = g_new0(unsigned long *, ct3d->dc.num_regions);
+    for (i = 0; i < ct3d->dc.num_regions; i++) {
+        region = &ct3d->dc.regions[i];
+        nbits = region->len / region->block_size;
+        bitmaps_copied[i] = bitmap_new(nbits);
+        bitmap_copy(bitmaps_copied[i], region->blk_bitmap, nbits);
+    }
+
+    for (i = 0; i < in->num_entries_updated; i++) {
+        dpa = in->updated_entries[i].start_dpa;
+        len = in->updated_entries[i].len;
+
+        rid = cxl_find_dc_region_id(ct3d, dpa, len);
+        region = &ct3d->dc.regions[rid];
+        offset = (dpa - region->base) / region->block_size;
+        nbits = len / region->block_size;
+
+        /* Check whether range [dpa, dpa + len) is covered by valid range */
+        if (find_next_zero_bit(bitmaps_copied[rid], offset + nbits, offset) <
+                               offset + nbits) {
+            ret = CXL_MBOX_INVALID_PA;
+            goto free_and_exit;
+        }
+
+        QTAILQ_FOREACH(ent, &tmp_list, node) {
+            /* Only split within an extent can cause extent count increase */
+            if (ent->start_dpa <= dpa &&
+                dpa + len <= ent->start_dpa + ent->len) {
+                uint64_t ent_start_dpa = ent->start_dpa;
+                uint64_t ent_len = ent->len;
+                uint64_t len1 = dpa - ent_start_dpa;
+                uint64_t len2 = ent_start_dpa + ent_len - dpa - len;
+
+                extent_cnt_delta += len1 && len2 ? 2 : (len1 || len2 ? 1 : 0);
+                extent_cnt_delta -= 1;
+                if (ct3d->dc.total_extent_count + extent_cnt_delta >
+                    CXL_NUM_EXTENTS_SUPPORTED) {
+                    ret = CXL_MBOX_RESOURCES_EXHAUSTED;
+                    goto free_and_exit;
+                }
+
+                offset = (ent->start_dpa - region->base) / region->block_size;
+                nbits = ent->len / region->block_size;
+                bitmap_clear(bitmaps_copied[rid], offset, nbits);
+                cxl_remove_extent_from_extent_list(&tmp_list, ent);
+
+                 if (len1) {
+                    offset = (dpa - region->base) / region->block_size;
+                    nbits = len1 / region->block_size;
+                    bitmap_set(bitmaps_copied[rid], offset, nbits);
+                    cxl_insert_extent_to_extent_list(&tmp_list,
+                                                     ent_start_dpa, len1,
+                                                     NULL, 0);
+                 }
+
+                 if (len2) {
+                    offset = (dpa + len - region->base) / region->block_size;
+                    nbits = len2 / region->block_size;
+                    bitmap_set(bitmaps_copied[rid], offset, nbits);
+                    cxl_insert_extent_to_extent_list(&tmp_list, dpa + len,
+                                                     len2, NULL, 0);
+                 }
+                 break;
+             }
+         }
+    }
+
+free_and_exit:
+    for (i = 0; i < ct3d->dc.num_regions; i++) {
+        g_free(bitmaps_copied[i]);
+    }
+    g_free(bitmaps_copied);
+
+    while (!QTAILQ_EMPTY(&tmp_list)) {
+        ent = QTAILQ_FIRST(&tmp_list);
+        cxl_remove_extent_from_extent_list(&tmp_list, ent);
+    }
+
+    return ret;
+}
+
+/*
  * CXL r3.1 section 8.2.9.9.9.4: Release Dynamic Capacity (Opcode 4803h)
  */
 static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
@@ -1644,15 +1793,28 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
         return ret;
     }
 
-    for (i = 0; i < in->num_entries_updated; i++) {
-        bool found = false;
+    ret = cxl_detect_extent_overflow(ct3d, in);
+    if (ret != CXL_MBOX_SUCCESS) {
+        return ret;
+    }
 
+    /*
+     * After this point, it is guaranteed that the extents in the
+     * updated extent list to release is valid, that means:
+     * 1. All extents in the list have no overlaps;
+     * 2. Each extent belongs to a valid DC region;
+     * 3. The DPA range of each extent is covered by valid extent
+     * in the device.
+     */
+    for (i = 0; i < in->num_entries_updated; i++) {
         dpa = in->updated_entries[i].start_dpa;
         len = in->updated_entries[i].len;
 
+process_leftover:
         QTAILQ_FOREACH(ent, extent_list, node) {
             /* Found the extent overlapping with */
             if (ent->start_dpa <= dpa && dpa < ent->start_dpa + ent->len) {
+                /* Case 1: The to-release extent is subset of ent */
                 if (dpa + len <= ent->start_dpa + ent->len) {
                     /*
                      * The incoming extent covers a portion of an extent
@@ -1669,17 +1831,6 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
                     uint64_t len1 = dpa - ent_start_dpa;
                     uint64_t len2 = ent_start_dpa + ent_len - dpa - len;
 
-                    /*
-                     * TODO: checking for possible extent overflow, will be
-                     * moved into a dedicated function of detecting extent
-                     * overflow.
-                     */
-                    if (len1 && len2 && ct3d->dc.total_extent_count ==
-                        CXL_NUM_EXTENTS_SUPPORTED) {
-                        return CXL_MBOX_RESOURCES_EXHAUSTED;
-                    }
-
-                    found = true;
                     cxl_remove_extent_from_extent_list(extent_list, ent);
                     ct3d->dc.total_extent_count -= 1;
                     ct3_clear_region_block_backed(ct3d, ent_start_dpa, ent_len);
@@ -1700,19 +1851,33 @@ static CXLRetCode cmd_dcd_release_dyn_cap(const struct cxl_cmd *cmd,
                     break;
                 } else {
                     /*
-                     * TODO: we reject the attempt to remove an extent that
-                     * overlaps with multiple extents in the device for now,
-                     * once the bitmap indicating whether a DPA range is
-                     * covered by valid extents is introduced, will allow it.
+                     * Case 2: the to-release extent overlaps with multiple
+                     * extents, including the superset case
                      */
-                    return CXL_MBOX_INVALID_PA;
+                    uint64_t ent_start_dpa = ent->start_dpa;
+                    uint64_t ent_len = ent->len;
+                    uint64_t len1 = dpa - ent_start_dpa;
+
+                    cxl_remove_extent_from_extent_list(extent_list, ent);
+                    ct3d->dc.total_extent_count -= 1;
+                    ct3_clear_region_block_backed(ct3d, ent_start_dpa, ent_len);
+
+                    if (len1) {
+                        cxl_insert_extent_to_extent_list(extent_list,
+                                                         ent_start_dpa, len1,
+                                                         NULL, 0);
+                        ct3d->dc.total_extent_count += 1;
+                        ct3_set_region_block_backed(ct3d, ent_start_dpa, len1);
+                    }
+                    /*
+                     * processing the portion of the range following current
+                     * extent
+                     */
+                    len = dpa + len - ent_start_dpa - ent_len;
+                    dpa = ent_start_dpa + ent_len;
+                    goto process_leftover;
                 }
             }
-        }
-
-        if (!found) {
-            /* Try to remove a non-existing extent. */
-            return CXL_MBOX_INVALID_PA;
         }
     }
 
