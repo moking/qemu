@@ -2126,6 +2126,97 @@ void qmp_cxl_release_dynamic_capacity(const char *path, uint16_t host_id,
     }
 }
 
+static void cxl_dcd_display_extent_list(const CXLType3Dev *dcd, const char *f,
+                                        bool accepted_list, Error **errp)
+{
+    FILE *fp = NULL;
+    int i = 0;
+
+    if (!dcd->dc.num_regions) {
+        error_setg(errp, "No dynamic capacity support from the device");
+        return;
+    }
+
+    if (!f) {
+        fp = fopen("/tmp/dc-extent.txt", "a+");
+    } else {
+        fp = fopen(f, "a+");
+    }
+
+    if (!fp) {
+        error_setg(errp, "Open log file failed");
+        return;
+    }
+    if (accepted_list) {
+        const CXLDCExtentList *list = &dcd->dc.extents;
+        CXLDCExtent *ent;
+        fprintf(fp, "Print accepted extent info:\n");
+
+        QTAILQ_FOREACH(ent, list, node) {
+            fprintf(fp, "%d: [0x%lx - 0x%lx]\n", i++, ent->start_dpa,
+                    ent->start_dpa + ent->len);
+        }
+    } else {
+        const CXLDCExtentGroupList *list = &dcd->dc.extents_pending;
+        CXLDCExtentGroup *group;
+        CXLDCExtent *ent;
+        int j = 0;
+
+        fprintf(fp, "Print pending-to-add extent info:\n");
+        QTAILQ_FOREACH(group, list, node) {
+            fprintf(fp, "Group %d\n", j++);
+            QTAILQ_FOREACH(ent, &group->list, node) {
+                fprintf(fp, " %d: [0x%lx - 0x%lx]\n", i++, ent->start_dpa,
+                        ent->start_dpa + ent->len);
+            }
+        }
+    }
+
+    fprintf(fp, "In total, %d extents printed!\n", i);
+    fclose(fp);
+}
+
+void qmp_cxl_display_accepted_dc_extents(const char *path, const char *f,
+                                         Error **errp)
+{
+    Object *obj;
+    CXLType3Dev *dcd;
+
+    obj = object_resolve_path(path, NULL);
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path not point to a valid CXL type3 device");
+        return;
+    }
+
+    dcd = CXL_TYPE3(obj);
+    cxl_dcd_display_extent_list(dcd, f, true, errp);
+}
+
+void qmp_cxl_display_pending_to_add_dc_extents(const char *path, const char *f,
+                                               Error **errp)
+{
+    Object *obj;
+    CXLType3Dev *dcd;
+
+    obj = object_resolve_path(path, NULL);
+    if (!obj) {
+        error_setg(errp, "Unable to resolve path");
+        return;
+    }
+    if (!object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "Path not point to a valid CXL type3 device");
+        return;
+    }
+
+
+    dcd = CXL_TYPE3(obj);
+    cxl_dcd_display_extent_list(dcd, f, false, errp);
+}
+
 static void ct3_class_init(ObjectClass *oc, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);

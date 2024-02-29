@@ -550,3 +550,37 @@
            },
   'features': [ 'unstable' ]
 }
+
+
+##
+# @cxl-display-accepted-dc-extents:
+#
+# Command to print out all the accepted DC extents in the device
+#
+# @path: CXL DCD canonical QOM path
+#
+# @output: path of output file to dump the results to
+#
+# Since : 9.1
+##
+{ 'command': 'cxl-display-accepted-dc-extents',
+  'data': { 'path': 'str',
+            'output': 'str'
+           }
+}
+
+##
+# @cxl-display-pending-to-add-dc-extents:
+#
+# Command to print out all the pending-to-add DC extents in the device
+#
+# @path: CXL DCD canonical QOM path
+# @output: path of output file to dump the results to
+#
+# Since : 9.1
+##
+{ 'command': 'cxl-display-pending-to-add-dc-extents',
+  'data': { 'path': 'str',
+            'output': 'str'
+           }
+}
