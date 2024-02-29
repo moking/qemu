@@ -1802,28 +1802,79 @@ typedef enum CXLDCEventType {
 } CXLDCEventType;
 
 /*
- * Check whether the exact extent exists in the list
- * Return value: the extent pointer in the list; else null
+ * Testing whether the DPA range [dpa, dpa + len) is covered by
+ * extents in the list.
  */
-static CXLDCExtent *cxl_dc_extent_exists(CXLDCExtentList *list,
-                                         CXLDCExtentRaw *ext)
+static bool cxl_test_dpa_range_covered_by_extents(CXLDCExtentList *list,
+                                                  uint64_t dpa, uint64_t len)
 {
     CXLDCExtent *ent;
 
-    if (!ext || !list) {
-        return NULL;
+    if (!list) {
+        return false;
     }
 
-    QTAILQ_FOREACH(ent, list, node) {
-        if (ent->start_dpa != ext->start_dpa) {
-            continue;
+    while (len) {
+        bool has_leftover = false;
+
+        QTAILQ_FOREACH(ent, list, node) {
+            if (ent->start_dpa <= dpa && dpa < ent->start_dpa + ent->len) {
+                if (dpa + len <= ent->start_dpa + ent->len) {
+                    return true;
+                } else {
+                    len = dpa + len - ent->start_dpa - ent->len;
+                    dpa = ent->start_dpa + ent->len;
+                    has_leftover = true;
+                    break;
+                }
+            }
         }
-
-        /* Found exact extent */
-        return ent->len == ext->len ? ent : NULL;
+        if (!has_leftover) {
+            break;
+        }
     }
+    return false;
+}
 
-    return NULL;
+/*
+ * Remove all extents whose DPA range has overlaps with  the DPA range
+ * [dpa, dpa + len) from the list, and delete the overlapped portion.
+ * Note:
+ * 1. If the removed extents is fully within the DPA range, delete the extent;
+ * 2. Otherwise, keep the portion that does not overlap, insert new extents to
+ * the list if needed for the un-coverlapped part.
+ */
+static void cxl_delist_extent_by_dpa_range(CXLDCExtentList *list,
+                                           uint64_t dpa, uint64_t len)
+{
+    CXLDCExtent *ent;
+
+process_leftover:
+    QTAILQ_FOREACH(ent, list, node) {
+        if (ent->start_dpa <= dpa && dpa < ent->start_dpa + ent->len) {
+            uint64_t ent_start_dpa = ent->start_dpa;
+            uint64_t ent_len = ent->len;
+            uint64_t len1 = dpa - ent_start_dpa;
+
+            cxl_remove_extent_from_extent_list(list, ent);
+            if (len1) {
+                cxl_insert_extent_to_extent_list(list, ent_start_dpa,
+                                                 len1, NULL, 0);
+            }
+
+            if (dpa + len <= ent_start_dpa + ent_len) {
+                uint64_t len2 = ent_start_dpa + ent_len - dpa - len;
+                if (len2) {
+                    cxl_insert_extent_to_extent_list(list, dpa + len,
+                                                     len2, NULL, 0);
+                }
+            } else {
+                len = dpa + len - ent_start_dpa - ent_len;
+                dpa = ent_start_dpa + ent_len;
+                goto process_leftover;
+            }
+        }
+    }
 }
 
 /*
@@ -1915,8 +1966,8 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
     list = records;
     extents = g_new0(CXLDCExtentRaw, num_extents);
     while (list) {
-        CXLDCExtent *ent;
         bool skip_extent = false;
+        CXLDCExtentList *extent_list;
 
         offset = list->value->offset;
         len = list->value->len;
@@ -1933,15 +1984,32 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
              * remove it from the pending extent list, so later when the add
              * response for the extent arrives, the device can reject the
              * extent as it is not in the pending list.
+             * Now, we can handle the case where the extent covers the DPA
+             * range of multiple extents in the pending_to_add list.
+             * TODO: we do not allow the extent covers range of extents in
+             * pending_to_add list and accepted list at the same time for now.
              */
-            ent = cxl_dc_extent_exists(&dcd->dc.extents_pending_to_add,
-                        &extents[i]);
-            if (ent) {
-                QTAILQ_REMOVE(&dcd->dc.extents_pending_to_add, ent, node);
-                g_free(ent);
+            extent_list = &dcd->dc.extents_pending_to_add;
+            if (cxl_test_dpa_range_covered_by_extents(extent_list,
+                                                      extents[i].start_dpa,
+                                                      extents[i].len)) {
+                cxl_delist_extent_by_dpa_range(extent_list,
+                                               extents[i].start_dpa,
+                                               extents[i].len);
+            } else if (!ct3_test_region_block_backed(dcd, extents[i].start_dpa,
+                                                     extents[i].len)) {
+                /*
+                 * If the DPA range of the extent is not covered by extents
+                 * in the accepted list, skip
+                 */
                 skip_extent = true;
-            } else if (!cxl_dc_extent_exists(&dcd->dc.extents, &extents[i])) {
-                /* If the exact extent is not in the accepted list, skip */
+            }
+        } else if (type == DC_EVENT_ADD_CAPACITY) {
+            extent_list = &dcd->dc.extents;
+            /* If the extent is ready pending to add, skip */
+            if (cxl_test_dpa_range_covered_by_extents(extent_list,
+                                                      extents[i].start_dpa,
+                                                      extents[i].len)) {
                 skip_extent = true;
             }
         }
