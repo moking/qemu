@@ -1784,26 +1784,76 @@ typedef enum CXLDCEventType {
     DC_EVENT_CAPACITY_RELEASED = 0x5,
 } CXLDCEventType;
 
+typedef enum {
+    DPA_RANGE_NOT_FOUND,
+    DPA_RANGE_FULL_EXTENT_MATCH,
+    DPA_RANGE_PARTIAL_MATCH
+} CXLDPARangeStatus;
+
 /*
- * Check whether the exact extent exists in the list
- * Return value: the extent pointer in the list; else null
+ * Check whether DPA range [dpa, dpa + len -1] is covered by extents in the
+ * pending list.
+ * Return value:
+ * 1. DPA_RANGE_NOT_FOUND: range has zero overlaps with extents;
+ * 2. DPA_RANGE_PARTIAL_MATCH: range partially overlaps with extents;
+ * 3. DPA_RANGE_FULL_EXTENT_MATCH: range fully covered by the extents, and
+ *    range start and end aligns with extents;
  */
-static CXLDCExtent *cxl_dc_extent_exists(CXLDCExtentList *list,
-                                         uint64_t dpa, uint64_t len)
+static CXLDPARangeStatus cxl_dpa_range_status_in_list(CXLDCExtentList *list,
+                                                      uint64_t dpa,
+                                                      uint64_t len)
 {
     CXLDCExtent *ent;
+    Range range;
 
     if (!list) {
-        return NULL;
+        return DPA_RANGE_NOT_FOUND;
     }
 
-    QTAILQ_FOREACH(ent, list, node) {
-        if (ent->start_dpa == dpa && ent->len == len) {
-            return ent;
+    while (len) {
+        bool range_narrowed = false;
+
+        QTAILQ_FOREACH(ent, list, node) {
+            range_init_nofail(&range, ent->start_dpa, ent->len);
+
+            if (range_contains(&range, dpa)) {
+                if (dpa != ent->start_dpa || len < ent->len) {
+                    return DPA_RANGE_PARTIAL_MATCH;
+                } else if (len == ent->len) {
+                    return DPA_RANGE_FULL_EXTENT_MATCH;
+                } else {
+                    dpa = ent->start_dpa + ent->len;
+                    len -= ent->len;
+                    range_narrowed = true;
+                }
+            }
+        }
+        if (!range_narrowed) {
+            break;
         }
     }
+    return DPA_RANGE_NOT_FOUND;
+}
 
-    return NULL;
+/*
+ * Remove all extents in the range [dpa, dpa + len -1]
+ * The range should be fully matched by the extents in the list
+ */
+static void cxl_remove_dc_extents_in_range(CXLDCExtentList *list,
+                                           uint64_t dpa, uint64_t len)
+{
+    CXLDCExtent *ent, *ent_next;
+    while (len > 0) {
+        QTAILQ_FOREACH_SAFE(ent, list, node, ent_next) {
+            if (ent->start_dpa == dpa) {
+                dpa = ent->start_dpa + ent->len;
+                len -= ent->len;
+
+                cxl_remove_extent_from_extent_list(list, ent);
+                break;
+            }
+        }
+    }
 }
 
 /*
@@ -1828,6 +1878,7 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
     uint64_t offset, len, block_size;
     int i, rc;
     g_autofree unsigned long *blk_bitmap = NULL;
+    CXLDPARangeStatus st;
 
     obj = object_resolve_path_type(path, TYPE_CXL_TYPE3, NULL);
     if (!obj) {
@@ -1890,9 +1941,13 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
         switch (type) {
         case DC_EVENT_RELEASE_CAPACITY:
         case DC_EVENT_FORCED_RELEASE_CAPACITY:
-            if (!cxl_dc_extent_exists(&dcd->dc.extents_pending,
-                                      start_dpa, len)) {
-                if (!cxl_dc_extent_exists(&dcd->dc.extents, start_dpa, len)) {
+            st = cxl_dpa_range_status_in_list(&dcd->dc.extents_pending,
+                                              start_dpa, len);
+            if (st == DPA_RANGE_PARTIAL_MATCH) {
+                error_setg(errp, "a portion of the extent range is pending");
+                return;
+            } else if (st == DPA_RANGE_NOT_FOUND) {
+                if (!ct3_test_region_block_backed(dcd, start_dpa, len)) {
                     error_setg(errp, "cannot release non-existing extent");
                     return;
                 }
@@ -1905,7 +1960,7 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
             }
             break;
         case DC_EVENT_ADD_CAPACITY:
-            if (cxl_dc_extent_exists(&dcd->dc.extents, start_dpa, len)) {
+            if (ct3_test_region_block_backed(dcd, start_dpa, len)) {
                 num_extents--;
             }
             break;
@@ -1924,7 +1979,6 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
     list = records;
     extents = g_new0(CXLDCExtentRaw, num_extents);
     while (list) {
-        CXLDCExtent *ent;
         uint64_t region_base;
 
         offset = list->value->offset;
@@ -1934,25 +1988,26 @@ static void qmp_cxl_process_dynamic_capacity(const char *path, CxlEventLog log,
         switch (type) {
         case DC_EVENT_RELEASE_CAPACITY:
         case DC_EVENT_FORCED_RELEASE_CAPACITY:
-            ent = cxl_dc_extent_exists(&dcd->dc.extents_pending,
-                                       region_base + offset, len);
-            if (ent) {
+            st = cxl_dpa_range_status_in_list(&dcd->dc.extents_pending,
+                                              region_base + offset, len);
+            if (st == DPA_RANGE_FULL_EXTENT_MATCH) {
                 /*
                  * If the extent to release has not been accepted by the host,
                  * remove it from the pending extent list, so later when
                  * the add response for the extent arrives, the device can
                  * reject the extent as there will not be a match in the
                  * pending list.
+                 * NOTE: the extent range can cover multiple extents when
+                 * superset release support is introduced.
                  */
-                cxl_remove_extent_from_extent_list(&dcd->dc.extents_pending,
-                                                   ent);
+                cxl_remove_dc_extents_in_range(&dcd->dc.extents_pending,
+                                               region_base + offset, len);
                 list = list->next;
                 continue;
             }
             break;
         case DC_EVENT_ADD_CAPACITY:
-            if (cxl_dc_extent_exists(&dcd->dc.extents, region_base + offset,
-                                     len)) {
+            if (ct3_test_region_block_backed(dcd, region_base + offset, len)) {
                 list = list->next;
                 continue;
             }
